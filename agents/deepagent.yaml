@@ -1,0 +1,93 @@
+# The deepAgent adapter: deepagents-code (dcode) driven over ACP stdio.
+# Values agree with aeval/agents/deepagent/agent.py — the declaration is
+# validated against the class (a disagreement is an error). The facts below
+# are source-backed against the deepagents-code source tree.
+extends: _base/agent.base.yaml
+
+id: deepagent
+version: "1"
+import_path: "aeval.agents.deepagent.agent:DcodeAgent"
+
+provides:
+  - acp_stdio
+  - shell
+  - file_tools
+
+mode: acp_stdio
+# Metered through the gateway lease: dcode speaks OpenAI, our broker speaks
+# aeval-model-broker/3, and the in-sandbox facade (control_stack below)
+# translates between them under the trial's job token. The adapter points the
+# agent at that facade automatically (facade_routing_env), so this claim and
+# the deployment move together — a suite that declares a spend cap is now
+# enforced rather than refused.
+budget_enforcement: gateway_lease
+
+# The generic control stack: NOT the DSH flavor. dcode is started by
+# Harbor's own ACP runner, so there is no plugin tree to graft — aeval uploads
+# the self-contained facade, starts it in the background and health-gates it
+# before the run proceeds. The fixed port is a shared contract
+# (contracts.FACADE_BASE_URL) the adapter points the agent at.
+control_stack: deepagent-facade
+
+# Model traffic routing: dcode's codex-profile
+# provider posts the OpenAI Responses protocol (POST /v1/responses), so the
+# facade serves the responses endpoint (AEVAL_FACADE_PROTOCOLS=responses) and
+# the broker's upstream speaks `responses` to the provider's responses base
+# (DeepSeek: https://api.deepseek.com, api-docs.deepseek.com "Using the
+# Responses API"). The env spellings are dcode facts (deepagents' ModelSpec
+# reads OPENAI_API_BASE for some providers; Harbor forwards OPENAI_BASE_URL):
+# the composition injects them with the facade's base URL and placeholder key.
+model_routing:
+  agent_protocol: openai_responses
+  env:
+    base_url: OPENAI_BASE_URL
+    alt_base_url: OPENAI_API_BASE
+    api_key: OPENAI_API_KEY
+
+transcript:
+  source: native_session_via_bridge
+  reader: harbor-acp-runner
+  capabilities:
+    - atif_via_bridge
+    - token_usage
+  fields_available:
+    events: ok
+    token_usage: partial
+
+# dcode is a Python package run through uvx; the Node observation is
+# DSH-specific. (Inherited from the base as [] — restated for readability.)
+# The sandbox image must nevertheless ship node: the facade runs on it.
+observations: []
+
+sandbox_home: /root/.deepagents
+# Relative to the DESCRIPTOR's directory, i.e. to Harbor's agent log directory
+# (/logs/agent, downloaded to <trial_dir>/agent/): the ACP runner writes its
+# summary at that root. There is no deepagent-home tree — declaring one made
+# every real run fail with "session_root does not exist" (observed on a real target host).
+session_artifact_dir: "."
+
+# The generic facade only proxies model traffic: nothing in the sandbox ever
+# sees an exit, so the owner observes the agent's own record at agent end and
+# states the terminal outcome itself (aeval.agents.contract). Which file that
+# record is belongs to the adapter, not to the framework.
+terminal_descriptor_owner: host
+sandbox_session_record: /logs/agent/acp-summary.json
+
+# How this adapter is launched in a deployment. The registry entry (uvx
+# deepagents-code==0.1.78 --acp) is built by the adapter itself, so the
+# profile carries only deployment facts: the uvx install of the pinned
+# package needs a generous setup window. Model routing (OPENAI_BASE_URL /
+# OPENAI_API_KEY / …) is supplied per job via the adapter's model_env kwarg,
+# which lands in the launcher env — never baked into a committed file.
+# 运行时需求（方案二）：沙箱里必须存在这个 CLI 才能跑起来。key 在组合期
+# 与 agents/_runtime/images.yaml 对账——没有对应行、或行的镜像摘要与
+# --sandbox-image 不一致，都在建沙箱之前拒绝，而不是在 trial 里炸
+# "command not found"。needs 是人类可读的供给事实，用于报错与审计。
+runtime:
+  key: deepagents-code
+  needs:
+    - node>=18（façade 在沙箱内跑）
+    - dcode CLI 已烘焙进镜像
+launch:
+  default:
+    override_setup_timeout_sec: 900
