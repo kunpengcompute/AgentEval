@@ -1,0 +1,26 @@
+schema_version: 2
+id: deepagent-hello
+# 0.2.0（2026-10-08）：注释清理——去掉对外不可读的内部阶段/缺陷编号与机器名。判分口径与任务集不变；因文件字节变化，本版本不与上一版同域可比。
+version: 0.2.0
+# 与 e2e-hello 同一任务形态（写 hello 到 /workspace/result），但面向
+# ACP 适配器：驱动要求只有 deepagent 提供的三项；会话记录槽位走通用
+# agent_session_record（deepagent 的官方会话记录是 Harbor ACP runner 的
+# summary，不是 DSH 会话文件）。**不设预算**：本套件是 façade 链路的冒烟，
+# 计量与上限拦截由 suites/deepagent-budget 承担（适配器已声明
+# budget_enforcement=gateway_lease，两套件都可被计量）。
+extends: _base/harbor.base.yaml
+harbor:
+  job: jobs/deepagent-hello.yaml
+driver:
+  # 驱动能力要求是本套件自己的事实（基座不含任何 agent 特性）：面向 ACP
+  # 适配器，只要求 deepagent 真正提供并能被验证的三项。
+  require: [acp_stdio, shell, file_tools]
+  session_record: agent_session_record
+observables:
+  - { name: result, type: string, source: "file:/workspace/result" }
+verdict:
+  graders:
+    default: { impl: "graders/hello_outcome.py@v1", layer: outcome }
+metrics:
+  - { id: reliability, kind: pass_pow_k, k: 5 }
+provenance: { source: authored-internally, license: MIT }
