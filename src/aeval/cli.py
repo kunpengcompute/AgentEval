@@ -1,0 +1,1527 @@
+"""aeval CLI.
+
+``run`` never builds its own trial loop — it validates the suite,
+synthesizes the Harbor job and delegates. ``selftest`` deliberately
+injects every failure class the gates exist to catch.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Annotated, Optional
+
+import typer
+
+from aeval.contracts import ExclusionSummary, RunManifest
+from aeval.suite_loader.loader import (
+    assert_unique_suite_identity,
+    discover_suites,
+    inherited_source_paths,
+    load_suite,
+    render_suite_explanation,
+)
+from aeval.verdict.pipeline import sealed_dimension_model
+
+app = typer.Typer(
+    name="aeval",
+    help="Agent trajectory evaluation on Harbor (experimental, agent-neutral core).",
+    no_args_is_help=True,
+)
+
+selftest_app = typer.Typer(help="Fault-injection selftests (must all block).")
+app.add_typer(selftest_app, name="selftest")
+
+
+EXIT_OK = 0
+EXIT_PARAM_ERROR = 2
+EXIT_VALIDATION_ERROR = 3
+EXIT_SYSTEM_ERROR = 4
+# Harbor exited 0 but the aeval chain is not complete (missing summary,
+# unobserved/unclassified trials, seal or recompute refused). The
+# Harbor exit code alone never means the evaluation completed.
+EXIT_E2E_INCOMPLETE = 5
+
+
+def _declared_adapter(import_path: str):
+    """The AdapterSpec an agent's import_path declares (aeval.agents.contract)."""
+    from aeval.agents.contract import build_adapter_spec, load_adapter_class
+
+    return build_adapter_spec(load_adapter_class(import_path), import_path=import_path)
+
+
+def _declares_facade_stack(agents) -> bool:
+    """Does any selected agent declare a stack that translates OpenAI wires?
+
+    Reads the flavor registry's ``serves_protocols`` capability — the same
+    declaration the plugin's bootstrap dispatches on — so the lock and the
+    deployment can never disagree about whether a facade ran. The generic
+    facade is the only registered translating stack today; a second one
+    extends the lock with its own artifact field rather than reusing this
+    predicate blindly.
+    """
+    from aeval.agents.contract import (
+        control_stack_of,
+        load_adapter_class,
+        stack_serves_any_openai,
+    )
+
+    for entry in agents:
+        import_path = getattr(entry, "import_path", None)
+        if not import_path:
+            continue
+        if stack_serves_any_openai(control_stack_of(load_adapter_class(str(import_path)))):
+            return True
+    return False
+
+
+def _die(message: str, code: int) -> int:
+    typer.secho(f"error: {message}", fg=typer.colors.RED, err=True)
+    raise typer.Exit(code=code)
+
+
+def _selected_runtime_keys(
+    job: Any, *, agents_root: Path
+) -> tuple[list[tuple[str, Any]], list[str]]:
+    """``(runtime declarations, adapters with no resolvable declaration)``.
+
+    Harbor-native ``name:`` agents and adapters that declare no runtime are
+    skipped quietly: there is nothing to host, so nothing to check. An adapter
+    WITH an import_path whose declaration cannot be resolved is reported to the
+    caller — the runtime guard cannot run for it, and that must be visible
+    rather than a silent pass. A wrong ``--agents-dir`` falls back to the
+    discovered agents root instead of silently finding nothing.
+    """
+    from aeval.agents.declaration import default_agents_root, find_declaration_for
+
+    root = Path(agents_root)
+    if not root.is_dir():
+        root = default_agents_root()
+    found: list[tuple[str, Any]] = []
+    unresolved: list[str] = []
+    for entry in getattr(job, "agents", None) or []:
+        import_path = getattr(entry, "import_path", None)
+        if not import_path:
+            continue
+        resolved = find_declaration_for(import_path, agents_root=root)
+        if resolved is None:
+            unresolved.append(str(import_path))
+            continue
+        if resolved.declaration.runtime is None:
+            continue
+        found.append((resolved.declaration.id, resolved.declaration.runtime))
+    return found, unresolved
+
+
+def _check_runtime_images(
+    suite_id: str,
+    job: Any,
+    *,
+    agents_root: Path,
+    sandbox_image: str | None,
+    sandbox_platform: str | None,
+    table_path: Path | None = None,
+) -> list[str]:
+    """Refuse a pairing whose sandbox cannot host the agent's CLI (方案二).
+
+    The declaration says what the agent needs, the table says where that is met;
+    an unmapped pairing is refused here — before Harbor builds anything — with
+    the fix spelled out, instead of failing inside the sandbox as
+    "command not found" once the budget is already running.
+    """
+    from aeval.agents.runtime import image_problem_for, load_runtime_images
+    from aeval.suite_models import SuiteError
+
+    table = load_runtime_images(table_path)
+    keys: list[str] = []
+    declared, unresolved = _selected_runtime_keys(job, agents_root=agents_root)
+    for import_path in unresolved:
+        typer.echo(
+            f"note: no agent declaration found for {import_path} — its declared "
+            "runtime cannot be checked against the image table"
+        )
+    for agent_id, runtime in declared:
+        problem = image_problem_for(
+            table,
+            suite_id=suite_id,
+            runtime=runtime,
+            image=sandbox_image,
+            platform=sandbox_platform,
+            table_path=table_path,
+        )
+        if problem:
+            raise SuiteError(f"agent {agent_id!r}: {problem}")
+        keys.append(runtime.key)
+    return keys
+
+
+@app.command("check")
+def check_cmd(
+    suite: Annotated[Path, typer.Option(help="Suite directory (contains suite.yaml)")],
+    agent: Annotated[str, typer.Option(help="Declared agent id to drive the suite")],
+    profile: Annotated[
+        str | None, typer.Option(help="Launch profile declared by the agent")
+    ] = None,
+    agents_dir: Annotated[
+        Path, typer.Option(help="Directory holding agents/<id>.yaml")
+    ] = Path("agents"),
+    sandbox_image: Annotated[
+        str | None, typer.Option(help="Digest-pinned sandbox image to check against the table")
+    ] = None,
+    sandbox_platform: Annotated[
+        str | None, typer.Option(help="Platform of that image (e.g. arm64)")
+    ] = None,
+) -> None:
+    """Report whether a (suite, agent) pairing can run — read-only, nothing built.
+
+    Answers the two questions that used to be discovered late: does the pairing
+    pass the composition gates (capabilities / session-record slot / budget), and
+    does the suite's runtime→image table cover the agent's declared runtime.
+    """
+    from aeval.agents.runtime import default_runtime_images_path, load_runtime_images
+    from aeval.suite_loader.composition import compose_harbor_job
+    from aeval.suite_loader.loader import load_suite
+    from aeval.suite_models import SuiteError
+
+    try:
+        resolved = load_suite(suite)
+        job = compose_harbor_job(
+            resolved, agent=agent, agent_profile=profile, agents_root=agents_dir
+        )
+    except (SuiteError, ValueError, OSError) as exc:
+        typer.echo(f"pairing {agent} × {suite}: REFUSED")
+        typer.echo(f"  {exc}")
+        raise typer.Exit(code=EXIT_VALIDATION_ERROR) from exc
+
+    typer.echo(
+        f"pairing {agent} × {resolved.id}: composed "
+        f"(impl={job.agents[0].import_path}, attempts={job.n_attempts})"
+    )
+    table = load_runtime_images()
+    picks, unresolved = _selected_runtime_keys(job, agents_root=agents_dir)
+    for import_path in unresolved:
+        typer.echo(
+            f"runtime: no declaration found for {import_path} — not checked"
+        )
+    if not picks:
+        typer.echo("runtime: none declared — nothing to host, nothing to check")
+        raise typer.Exit(code=0)
+    problems: list[str] = []
+    for agent_id, runtime in picks:
+        entry = table.lookup(resolved.id, runtime.key)
+        if entry is None:
+            shown = "(no row)"
+        elif entry.image is None:
+            shown = "(rides the task image)"
+        else:
+            shown = f"{entry.image} ({entry.platform})"
+        typer.echo(f"runtime {runtime.key} for {agent_id}: {shown}")
+        from aeval.agents.runtime import image_problem_for
+
+        problem = image_problem_for(
+            table,
+            suite_id=resolved.id,
+            runtime=runtime,
+            image=sandbox_image,
+            platform=sandbox_platform,
+            table_path=default_runtime_images_path(),
+        )
+        if problem:
+            problems.append(problem)
+    if problems:
+        typer.echo("runtime image check: FAILED")
+        for problem in problems:
+            typer.echo(f"  {problem}")
+        raise typer.Exit(code=EXIT_VALIDATION_ERROR)
+    typer.echo("runtime image check: OK")
+    raise typer.Exit(code=0)
+
+
+@app.command("run")
+def run_cmd(
+    suite: Annotated[Path, typer.Option(help="Suite directory (contains suite.yaml)")],
+    run_dir: Annotated[Path, typer.Option(help="Output run directory")],
+    store: Annotated[Path, typer.Option(help="SQLite store path")],
+    harbor_cli: Annotated[str, typer.Option(help="Harbor entrypoint to delegate to")] = "harbor",
+    sandbox_image: Annotated[
+        str | None, typer.Option(help="Digest-pinned sandbox image (ref@sha256:...) recorded in the runtime lock")
+    ] = None,
+    sandbox_platform: Annotated[
+        str | None, typer.Option(help="Platform of the pinned sandbox image (e.g. arm64)")
+    ] = None,
+    accept_unmetered_budget: Annotated[
+        bool,
+        typer.Option(
+            help="Run even though the selected adapter's spend is not metered by the gateway lease"
+        ),
+    ] = False,
+    agent: Annotated[
+        str | None,
+        typer.Option(help="Declared agent id to drive the suite (default: the job file's own entry)"),
+    ] = None,
+    profile: Annotated[
+        str | None, typer.Option(help="Launch profile declared by the agent")
+    ] = None,
+    agents_dir: Annotated[
+        Path, typer.Option(help="Directory holding agents/<id>.yaml")
+    ] = Path("agents"),
+    session_record: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Use this session-record slot instead of the suite's declared one "
+                "for THIS run (must equal the selected adapter's SESSION_RECORD_OUTPUT); "
+                "recorded in the run manifest"
+            )
+        ),
+    ] = None,
+    force_build: Annotated[
+        bool, typer.Option(help="Rebuild the sandbox template instead of reusing a cached alias")
+    ] = False,
+) -> None:
+    """Validate + synthesize a Harbor job and DELEGATE the run to Harbor."""
+    import os
+    import subprocess
+
+    from aeval.bundle.manifest import (
+        ManifestTamperError,
+        validate_manifest_references,
+        write_intent_manifest,
+    )
+    from hashlib import sha256
+    from importlib.metadata import version
+
+    from aeval.contracts import OverlayIdentity, VersionsBundle
+    from aeval.provenance import LockMismatchError, build_runtime_lock, lock_report
+    from aeval.suite_loader.composition import compose_harbor_job, suite_path, suite_source_commit
+    from aeval.suite_models import SuiteError
+
+    try:
+        suite, run_dir = suite.resolve(), run_dir.resolve()
+        if run_dir.exists():
+            raise SuiteError("Run directories are never reused; choose a new --run-dir")
+        if run_dir.is_relative_to(suite):
+            raise SuiteError("Run output must be outside the source suite directory")
+        resolved = load_suite(suite)
+        # The operator's broker spec carries the run's model identity. Stating it
+        # in the composed agent entry is what lets an adapter whose CLI would
+        # otherwise pick its own default (and so its own wire protocol) agree
+        # with the lease that will meter it.
+        from aeval.hooks.broker_lifecycle import parse_broker_spec
+        from aeval.suite_loader.composition import lease_model_name
+
+        broker_spec = parse_broker_spec()
+        if session_record is not None:
+            from aeval.agents.contract import session_record_slot_well_formed
+
+            if not session_record_slot_well_formed(session_record):
+                raise SuiteError(
+                    f"--session-record must be a lowercase slot slug, got {session_record!r}"
+                )
+        job = compose_harbor_job(
+            resolved,
+            agent=agent,
+            agent_profile=profile,
+            agents_root=agents_dir,
+            lease_model=lease_model_name(broker_spec),
+            session_record=session_record,
+        )
+        if agent is not None:
+            typer.echo(
+                f"composed for agent {agent} (profile {profile or 'default'}): "
+                f"{job.agents[0].import_path}"
+            )
+        runtime_keys = _check_runtime_images(
+            resolved.id,
+            job,
+            agents_root=agents_dir,
+            sandbox_image=sandbox_image,
+            sandbox_platform=sandbox_platform,
+        )
+        if session_record is not None:
+            declared = getattr(
+                getattr(resolved.overlay, "driver", None), "session_record", None
+            )
+            typer.echo(
+                f"session-record override: {session_record!r} "
+                f"(suite declares {declared!r}) — recorded in the run manifest"
+            )
+        # Declared adapter identity, resolved before anything runs: a run whose
+        # records cannot name its agent is refused here, not discovered later.
+        from aeval.agents.contract import load_adapter_class
+
+        selected = []
+        for entry in job.agents:
+            import_path = getattr(entry, "import_path", None)
+            if not import_path:
+                continue
+            selected.append((load_adapter_class(str(import_path)), str(import_path)))
+        adapters = [
+            _declared_adapter(import_path) for _cls, import_path in selected
+        ]
+        from aeval.agents.contract import budget_enforcement_point, budget_gate_violation
+
+        violation = budget_gate_violation(
+            adapters, resolved.overlay.budget, accepted=accept_unmetered_budget
+        )
+        if violation:
+            raise SuiteError(violation)
+        budget_point = budget_enforcement_point(adapters)
+        if force_build:
+            # The first run (and every run after the base image
+            # digest changes) must rebuild — Harbor reuses an existing
+            # template alias otherwise, silently running the experiment on
+            # a stale image. `aeval run` delegates to Harbor, so the flag
+            # must be carried in the composed job.
+            job.environment.force_build = True
+        source_commit = suite_source_commit(suite, inherited_source_paths(resolved))
+        job.jobs_dir = run_dir / "harbor"
+        if len(Path(job.job_name).parts) != 1 or job.job_name in ("", ".", ".."):
+            raise SuiteError("Harbor job_name must be a single directory name")
+        suite_path(run_dir, job.job_name)
+        job_path = run_dir / "harbor-job.json"
+        from aeval.contracts import job_config_hash, job_config_json
+
+        config_json = job_config_json(job)
+
+        config_hash = job_config_hash(job)
+        lock_ref = f"harbor/{job.job_name}/lock.json"
+        images = None
+        if sandbox_image is not None:
+            # The E2E lock must pin the sandbox image: observed-identity
+            # binding compares the live sandbox against exactly
+            # this entry. Both options are required together, and the
+            # reference must be digest-pinned.
+            from aeval.contracts import ImageIdentity
+
+            if sandbox_platform is None:
+                raise SuiteError(
+                    "--sandbox-image requires --sandbox-platform (the observed "
+                    "identity binds the architecture too)"
+                )
+            digest_sep = "@sha256:"
+            if digest_sep not in sandbox_image:
+                raise SuiteError(
+                    f"--sandbox-image must be digest-pinned (ref@sha256:...): {sandbox_image!r}"
+                )
+            images = {
+                "sandbox": ImageIdentity(
+                    reference=sandbox_image,
+                    digest=sandbox_image.split(digest_sep, 1)[1],
+                    platform=sandbox_platform,
+                ),
+            }
+        # Which agents this run selects decides which agent releases belong in
+        # the lock: each selected adapter's OFFICIAL_RELEASE_LOCK hook
+        # contributes its own pin (the dsh adapter declares the official DSH
+        # slice; an agent without a pinned release contributes nothing), so the
+        # lock builder itself names no agent — without this a non-Node agent
+        # could not produce a lock at all (a lock without a DSH section used
+        # to be rejected outright).
+        from aeval.agents.contract import official_release_lock_of
+
+        release_locks = {}
+        for (adapter_class, _import_path), spec in zip(selected, adapters):
+            pinned = official_release_lock_of(adapter_class)
+            if pinned is not None:
+                release_locks[spec.id] = pinned
+        # The control dist the operator's broker spec provides is part of what
+        # ran: fingerprint it into the lock so a changed control build breaks
+        # comparability loudly instead of shifting behavior silently inside
+        # the agent's process (defense 2 of the control-stack split).
+        # ``broker_spec`` was parsed before composition, so the model it pins is
+        # already stated in the agent entry.
+        # The generic facade is part of what runs, exactly like the DSH
+        # control dist: when a selected adapter declares that stack, the
+        # built dist is fingerprinted into the lock. A missing dist is
+        # refused here rather than silently running unmetered.
+        facade_dist = None
+        if _declares_facade_stack(job.agents):
+            from aeval.control.bootstrap import BootstrapError, resolve_facade_dist
+
+            try:
+                facade_dist = resolve_facade_dist()
+            except BootstrapError as exc:
+                raise SuiteError(str(exc)) from exc
+        lock = build_runtime_lock(
+            images=images,
+            release_locks=release_locks,
+            control_dist=broker_spec.control_dist if broker_spec else None,
+            facade_dist=facade_dist,
+        )
+        # 族模式（v4）：清单封存的维度模型补上引擎自证身份（族→用例
+        # →引擎，含 resolved grader_id）——报告 join 只读密封映射，
+        # 不 import 判分器（P4）。说谎/缺失的引擎在这里就报错。
+        dimension_model = sealed_dimension_model(resolved)
+        manifest = RunManifest(
+            run_id=f"run-{run_dir.name}",
+            runtime_lock=lock,
+            runtime_lock_digest=lock.digest(),
+            lock_ref=lock_ref,
+            config_hash=config_hash,
+            config_file_sha256=sha256(config_json.encode("utf-8")).hexdigest(),
+            adapters=adapters,
+            budget_enforcement_point=budget_point,
+            accepted_unmetered_budget=accept_unmetered_budget,
+            session_record_override=session_record,
+            runtime_keys=runtime_keys,
+            overlay=OverlayIdentity(
+                suite_id=resolved.id,
+                suite_version=resolved.version,
+                overlay_digest=resolved.suite_yaml_digest,
+                overlay_chain_digest=resolved.identity_digest,
+                source_commit=source_commit,
+            ),
+            task_titles=resolved.task_titles,
+            dimension_model=dimension_model,
+            versions=VersionsBundle(
+                aeval_version=version("aeval-harbor"),
+                converter_version=resolved.overlay.provenance.converter_version,
+            ),
+        )
+        validate_manifest_references(manifest)
+        run_dir.mkdir(parents=True)
+        write_intent_manifest(manifest, run_dir)
+        job_path.write_bytes(config_json.encode("utf-8"))
+        lock_path = run_dir / "runtime_lock.json"
+        lock_path.write_text(lock.model_dump_json(indent=2), encoding="utf-8")
+    except (SuiteError, LockMismatchError, ManifestTamperError, ValueError) as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+    except OSError as exc:
+        _die(str(exc), EXIT_SYSTEM_ERROR)
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "AEVAL_SUITE_DIR": str(suite),
+            "AEVAL_RUN_DIR": str(run_dir),
+            "AEVAL_STORE_PATH": str(store.resolve()),
+            "AEVAL_RUN_ID": manifest.run_id,
+            "AEVAL_RUNTIME_LOCK": str(lock_path),
+        }
+    )
+    # Record the trusted intent copy in the store BEFORE any trial can
+    # exist: the seal-time intent check compares against this record.
+    from aeval.store.sqlite import StoreConflictError, TrialStore
+
+    try:
+        intent_store = TrialStore(store)
+        try:
+            intent_store.create_run(manifest)
+        finally:
+            intent_store.close()
+    except StoreConflictError as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+    except OSError as exc:
+        _die(str(exc), EXIT_SYSTEM_ERROR)
+
+    typer.echo(lock_report(lock))
+    typer.echo(f"delegating to Harbor: {harbor_cli} run --config {job_path}")
+    try:
+        result = subprocess.run(
+            [harbor_cli, "run", "--config", str(job_path), "--plugin", "aeval.hooks:AevalPlugin"],
+            env=env,
+        )
+    except OSError as exc:
+        _die(f"Cannot start Harbor: {exc}", EXIT_SYSTEM_ERROR)
+    if result.returncode != 0:
+        # Harbor itself failed: no seal attempt, the run stays unsealed
+        # and the failure code propagates unchanged.
+        raise typer.Exit(result.returncode)
+
+    # Harbor exited 0 — that only means the process exited. The aeval
+    # chain is complete only if finalization proves it.
+    from aeval.bundle.finalize import FinalizeError, finalize_run
+
+    try:
+        report = finalize_run(run_dir, store)
+    except FinalizeError as exc:
+        typer.secho(f"run incomplete: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(EXIT_E2E_INCOMPLETE) from exc
+    typer.echo(
+        f"run {report.run_id} sealed: {report.recorded_trials} trial(s) recorded, "
+        f"{report.attested_files} file(s) attested, recompute passed"
+    )
+    # "Sealed" is a statement about the evidence chain, not about the run being
+    # usable: an excluded trial is not scored at all, and a run whose trials
+    # were all excluded measured nothing while still exiting 0 and sealing.
+    # The per-trial cause is in the summary, but nobody reads a JSON first, so
+    # the shape of the loss is printed here.
+    exclusions = report.exclusions
+    if exclusions is not None and exclusions.excluded:
+        for reason, count in sorted(exclusions.excluded.items()):
+            typer.secho(
+                f"  excluded {count} trial(s): {reason}",
+                fg=typer.colors.YELLOW, err=True,
+            )
+        typer.secho(
+            f"  {exclusions.valid}/{exclusions.total} trial(s) scored "
+            f"(exclusion rate {exclusions.exclusion_rate:.1%}) — the cause of each "
+            f"is in {run_dir / 'aeval_run_summary.json'} under "
+            "trials[*].infra_invalid_reasons",
+            fg=typer.colors.YELLOW, err=True,
+        )
+    raise typer.Exit(EXIT_OK)
+
+
+@app.command("probe")
+def probe_cmd(
+    suite: Annotated[Path, typer.Option()],
+) -> None:
+    """Validate native declarations without running agents or fetching datasets."""
+    from aeval.suite_loader.composition import compose_harbor_job
+    from aeval.suite_models import SuiteError
+
+    try:
+        resolved = load_suite(suite)
+        job = compose_harbor_job(resolved)
+        typer.echo(
+            f"suite {resolved.id} v{resolved.version} "
+            f"overlay-digest={resolved.suite_yaml_digest[:12]} "
+            f"chain-digest={resolved.identity_digest[:12]} "
+            f"extends={resolved.extends or '(none)'} "
+            f"task-references={len(job.tasks)} remote-datasets={len(job.datasets)}"
+        )
+        typer.echo(
+            "Configuration validated; the selected agent's declared capabilities were "
+            "checked. Remote task content and live runtime capabilities are not probed."
+        )
+    except (SuiteError, ValueError, OSError) as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+
+
+@app.command("job")
+def job_cmd(
+    suite: Annotated[Path, typer.Option(help="Suite directory")],
+    agent: Annotated[str, typer.Option(help="Declared agent id to drive the suite")],
+    profile: Annotated[str | None, typer.Option(help="Launch profile declared by the agent")] = None,
+    agents_dir: Annotated[Path, typer.Option(help="Directory holding agents/<id>.yaml")] = Path("agents"),
+) -> None:
+    """Compose a suite's Harbor job for a declared agent.
+
+    The job file describes the task arm; which agent drives it comes from the
+    declaration. Pairing therefore costs a declaration, not another job file.
+    """
+    from aeval.suite_loader.composition import compose_harbor_job
+    from aeval.suite_loader.loader import load_suite
+    from aeval.suite_models import SuiteError
+
+    try:
+        resolved = load_suite(suite)
+        job = compose_harbor_job(
+            resolved, agent=agent, agent_profile=profile, agents_root=agents_dir
+        )
+        entry = job.agents[0]
+        typer.echo(
+            f"job {job.job_name}: suite={resolved.id} agent={agent} "
+            f"profile={profile or 'default'} attempts={job.n_attempts} "
+            f"impl={entry.import_path}"
+        )
+        typer.echo(
+            "Composed for a pairing: the job file's task arm is unchanged and the "
+            "agent entry comes from the declaration. Nothing was executed."
+        )
+    except (SuiteError, ValueError, OSError) as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+
+
+@app.command("conformance")
+def conformance_cmd(
+    agent: Annotated[Path, typer.Option(help="agents/<id>.yaml declaration to check")],
+    agents_dir: Annotated[Path, typer.Option(help="Directory holding agents/<id>.yaml")] = Path("agents"),
+    suite: Annotated[
+        list[Path] | None,
+        typer.Option(help="Suite directory to check the pairing against (repeatable)"),
+    ] = None,
+) -> None:
+    """Prove an agent adapter is fit to be evaluated — and say what was not exercised.
+
+    Every check maps to a way a second agent breaks an evaluation silently.
+    A check that could not run is reported as skipped, never as passed.
+    """
+    from aeval.agents.conformance import run_conformance_for
+    from aeval.agents.declaration import resolve_agent_declaration
+    from aeval.suite_models import SuiteError
+
+    try:
+        resolved = resolve_agent_declaration(agent, agents_root=agents_dir)
+        reports = run_conformance_for(
+            resolved.declaration.import_path,
+            declaration_path=agent,
+            agents_root=agents_dir,
+            suite_paths=list(suite or []),
+        )
+        failed = False
+        for report in reports:
+            typer.echo(report.render())
+            failed = failed or not report.ok
+        if failed:
+            raise typer.Exit(code=EXIT_VALIDATION_ERROR)
+    except (SuiteError, ValueError, OSError) as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+
+
+@app.command("new-agent")
+def new_agent_cmd(
+    agent_id: Annotated[str, typer.Option("--id", help="New agent id, e.g. deepagent")],
+    mode: Annotated[str, typer.Option(help="installed_cli | acp_stdio | sdk_jsonrpc")] = "installed_cli",
+    provides: Annotated[str, typer.Option(help="Comma-separated capabilities")] = "shell",
+    budget: Annotated[str, typer.Option(help="none | gateway_lease | wallclock_kill")] = "none",
+    agents_dir: Annotated[Path, typer.Option(help="Directory holding agents/<id>.yaml")] = Path("agents"),
+    package_dir: Annotated[Path | None, typer.Option(help="Where to write the adapter module")] = None,
+    import_path: Annotated[str | None, typer.Option(help="Override the generated import path")] = None,
+    transcript_source: Annotated[str, typer.Option(help="atif_native | native_session_via_bridge")] = "atif_native",
+    force: Annotated[bool, typer.Option(help="Overwrite an existing declaration")] = False,
+) -> None:
+    """Scaffold a conformant adapter skeleton + declaration for a new agent.
+
+    The generated reader raises NotImplementedError, so conformance reports the
+    transcript check as skipped with that reason — never as passed.
+    """
+    from aeval.agents.scaffold import scaffold_agent
+    from aeval.suite_models import SuiteError
+
+    try:
+        result = scaffold_agent(
+            agents_dir,
+            agent_id,
+            mode=mode,
+            provides=[item.strip() for item in provides.split(",") if item.strip()],
+            budget_enforcement=budget,
+            transcript_source=transcript_source,
+            package_dir=package_dir,
+            import_path=import_path,
+            force=force,
+        )
+    except (SuiteError, ValueError, OSError) as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+        return
+    typer.echo(result.render())
+
+
+@app.command("agents")
+def agents_cmd(
+    agents_dir: Annotated[Path, typer.Option(help="Directory holding agents/<id>.yaml")] = Path("agents"),
+    init: Annotated[
+        bool,
+        typer.Option("--init", help="Write the shipped starter declarations into the agents directory"),
+    ] = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="With --init: overwrite files that already exist")
+    ] = False,
+) -> None:
+    """List declared agent adapters and prove each agrees with its adapter class.
+
+    The declaration is the discoverable surface; the class is what the runtime
+    reads. Printing both here — and failing loudly on disagreement — is what keeps
+    them from drifting apart unnoticed.
+
+    ``--init`` writes the declarations this install ships (the base, the
+    runtime→image table, and the DSH adapter) so an installed aeval has a
+    starting point instead of an empty directory.
+    """
+    from aeval.agents.contract import load_adapter_class
+    from aeval.agents.declaration import (
+        declaration_class_mismatches,
+        discover_agent_declarations,
+        resolve_agent_declaration,
+    )
+    from aeval.agents.scaffold import write_starter_declarations
+    from aeval.suite_loader.paths import suite_path
+    from aeval.suite_models import SuiteError
+
+    try:
+        if init:
+            for path in write_starter_declarations(agents_dir, force=force):
+                typer.echo(f"wrote {path}")
+            typer.echo(
+                f"next: `aeval agents --agents-dir {agents_dir}` should list the "
+                "adapters, then set the launch kwargs in the declaration for your "
+                "sandbox (install prefix, npm cache, session reader)."
+            )
+            return
+        ids = discover_agent_declarations(agents_dir)
+        if not ids:
+            _die(f"no agent declarations under {agents_dir}", EXIT_VALIDATION_ERROR)
+        for agent_id in ids:
+            resolved = resolve_agent_declaration(
+                suite_path(Path(agents_dir).resolve(), f"{agent_id}.yaml"), agents_root=agents_dir
+            )
+            declaration = resolved.declaration
+            # the class the runtime resolves: itself when pinned, the
+            # materialized per-agent class when declaration-driven
+            adapter = declaration.adapter_class()
+            mismatches = declaration_class_mismatches(declaration, adapter)
+            if mismatches:
+                raise SuiteError(
+                    f"agent {agent_id}: declaration disagrees with {declaration.import_path}: "
+                    + "; ".join(mismatches)
+                )
+            typer.echo(
+                f"agent {declaration.id} v{declaration.version} "
+                f"mode={declaration.mode} budget={declaration.budget_enforcement} "
+                f"provides={sorted(declaration.provides)} "
+                f"observations={sorted(declaration.observations)} "
+                f"extends={[source.path for source in resolved.sources[:-1]] or '(none)'}"
+            )
+        typer.echo(f"{len(ids)} agent declaration(s) agree with their adapter classes.")
+    except (SuiteError, ValueError, OSError) as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+
+
+@app.command("list")
+def list_cmd(
+    suites_dir: Annotated[Path, typer.Option()],
+) -> None:
+    """List discovered suites."""
+    from aeval.suite_models import SuiteError
+
+    try:
+        suites = [load_suite(path) for path in discover_suites([suites_dir])]
+        assert_unique_suite_identity(suites)
+        for resolved in suites:
+            typer.echo(f"{resolved.id}\t{resolved.version}\t{resolved.suite_dir}")
+    except (SuiteError, ValueError, OSError) as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+
+
+@app.command("import")
+def import_cmd(
+    src: Annotated[Path, typer.Option(help="Complete native suite directory containing suite.yaml")],
+    out: Annotated[Path, typer.Option(help="New output suite directory; never overwritten")],
+    version: Annotated[str, typer.Option(help="New suite version")],
+    format: Annotated[str, typer.Option(help="Verified format: harbor-task")] = "harbor-task",
+) -> None:
+    from aeval.suite_loader.transfer import import_suite
+    from aeval.suite_models import SuiteError
+
+    try:
+        result = import_suite(src, out, version=version, format=format)
+    except (SuiteError, ValueError, OSError) as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+    typer.echo(f"Imported native suite: {result}; run probe, then commit its source before run.")
+
+
+@app.command("export")
+def export_cmd(
+    suite: Annotated[Path, typer.Option(help="Native suite directory")],
+    out: Annotated[Path, typer.Option(help="New output suite directory; never overwritten")],
+    format: Annotated[str, typer.Option(help="Verified format: harbor-task")] = "harbor-task",
+) -> None:
+    from aeval.suite_loader.transfer import export_suite
+    from aeval.suite_models import SuiteError
+
+    try:
+        result = export_suite(suite, out, format=format)
+    except (SuiteError, ValueError, OSError) as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+    typer.echo(f"Exported native suite and overlay: {result}")
+
+
+def _evidence_context_window(evidence) -> int | None:
+    """读取密封轨迹自携带的上下文窗口（ATIF agent 块 extra.contextWindow）。
+
+    driver 经官方 request/context 事件把 provider 声明的窗口写入会话，mapper
+    再抬进 agent 块的中立键 ``contextWindow``（不绑定具体 agent 名），因此证据
+    自携带、面板可自动换算占用率。缺失或非正整数一律返回 None——绝不臆造窗口。
+    """
+    try:
+        window = (evidence.transcript.atif.agent.extra or {}).get("contextWindow")
+    except AttributeError:
+        return None
+    if type(window) is int and window > 0:
+        return window
+    return None
+
+
+def _iter_sealed_evidence(store: Path, records):
+    """逐试次产出 ``(record, evidence, reason)``。
+
+    evidence 可用时 reason 为 None；否则 evidence 为 None、reason 说
+    明原因（试次目录缺失 / 密封轨迹不可读）。trial 目录名无契约保
+    证（驱动自定义），唯一可靠的映射是目录内 collection_manifest
+    .json 记录的 trial_id。
+    """
+    import json as _json
+
+    from aeval.verdict.trajectory.base import (
+        SealedTranscriptError,
+        build_evidence,
+        load_sealed_transcript,
+    )
+
+    trials_dir = store.parent / "trials"
+    dir_by_trial: dict[str, Path] = {}
+    if trials_dir.is_dir():
+        for entry in sorted(trials_dir.iterdir()):
+            manifest_path = entry / "collection_manifest.json"
+            if not entry.is_dir() or not manifest_path.is_file():
+                continue
+            try:
+                sealed_id = _json.loads(
+                    manifest_path.read_text("utf-8")
+                ).get("trial_id")
+            except (OSError, ValueError):
+                continue
+            if isinstance(sealed_id, str):
+                dir_by_trial[sealed_id] = entry
+
+    for record in records:
+        trial_dir = dir_by_trial.get(record.trial_id)
+        if trial_dir is None:
+            yield record, None, "试次目录缺失"
+            continue
+        try:
+            transcript = load_sealed_transcript(
+                record.model_copy(update={"artifact_base": str(trial_dir)})
+            )
+        except SealedTranscriptError as exc:
+            yield record, None, exc.reason
+            continue
+        yield record, build_evidence(transcript, record.stop_reason), None
+
+
+def _collect_run_inputs(stores: list[Path], run_ids: list[str]):
+    """多 store 聚合入口：按 run_id 找到拥有它的 store，取试次与清单。
+
+    ``--store`` 可重复给出，用来聚合**同一套件**的多个 run（重复跑 /
+    不同条件）——每个 run 的密封证据在自己的 run 目录里。一份报告只
+    属于一个套件：跨套件由 ``aggregate_run`` 拒绝（见 report.py）。
+    一个 run 不在任何 store 里 = 报错（不许静默漏一个）。返回 ``(trials, manifests, run_store)``，
+    ``run_store[run_id]`` 是该 run 证据所在的 store 路径。
+    """
+    from aeval.store.sqlite import TrialStore
+
+    trials: list = []
+    manifests = []
+    run_store: dict[str, Path] = {}
+    for run_id in run_ids:
+        db = None
+        manifest = None
+        owner = None
+        for candidate in stores:
+            probe = TrialStore(candidate)
+            try:
+                manifest = probe.load_run_manifest(run_id)
+            except KeyError:
+                probe.close()
+                continue
+            else:
+                db = probe
+                owner = candidate
+                break
+        if db is None or manifest is None:
+            _die(
+                f"run {run_id!r} is not recorded in any of the given stores "
+                f"({', '.join(str(s) for s in stores)}) — cannot report "
+                "unrecorded runs",
+                EXIT_VALIDATION_ERROR,
+            )
+        try:
+            manifests.append(manifest)
+            trials.extend(db.list_trials([run_id]))
+            run_store[run_id] = owner
+        finally:
+            db.close()
+    return trials, manifests, run_store
+
+
+def _iter_sealed_evidence_multi(run_store: dict[str, Path], records):
+    """逐试次产出 ``(record, evidence, reason)``（多 store 版）。
+
+    trial 目录的定位与单 store 版相同（store.parent/trials 下的
+    collection_manifest 记录 trial_id），只是每个 record 用它所属
+    run 的 store。
+    """
+    import json as _json
+
+    from aeval.verdict.trajectory.base import (
+        SealedTranscriptError,
+        build_evidence,
+        load_sealed_transcript,
+    )
+
+    dir_by_trial: dict[str, Path] = {}
+    seen_dirs: set[Path] = set()
+    for store in set(run_store.values()):
+        trials_dir = store.parent / "trials"
+        if trials_dir in seen_dirs or not trials_dir.is_dir():
+            continue
+        seen_dirs.add(trials_dir)
+        for entry in sorted(trials_dir.iterdir()):
+            manifest_path = entry / "collection_manifest.json"
+            if not entry.is_dir() or not manifest_path.is_file():
+                continue
+            try:
+                sealed_id = _json.loads(
+                    manifest_path.read_text("utf-8")
+                ).get("trial_id")
+            except (OSError, ValueError):
+                continue
+            if isinstance(sealed_id, str):
+                dir_by_trial[sealed_id] = entry
+
+    for record in records:
+        trial_dir = dir_by_trial.get(record.trial_id)
+        if trial_dir is None:
+            yield record, None, "试次目录缺失"
+            continue
+        try:
+            transcript = load_sealed_transcript(
+                record.model_copy(update={"artifact_base": str(trial_dir)})
+            )
+        except SealedTranscriptError as exc:
+            yield record, None, exc.reason
+            continue
+        yield record, build_evidence(transcript, record.stop_reason), None
+
+
+def _load_trajectory_stats_multi(
+    run_store: dict[str, Path], records
+) -> tuple[list, list[tuple[str, str]]]:
+    """逐试次采集密封轨迹（多 store 版，与单 store 同语义）。"""
+    from aeval.verdict.trajectory.stats import collect_stats
+
+    stats: list = []
+    unavailable: list[tuple[str, str]] = []
+    for record, evidence, reason in _iter_sealed_evidence_multi(
+        run_store, records
+    ):
+        if evidence is None:
+            unavailable.append((record.trial_id, reason))
+        else:
+            stats.append(collect_stats(record, evidence))
+    return stats, unavailable
+
+
+@app.command("report")
+def report_cmd(
+    store: Annotated[list[Path], typer.Option("--store")],
+    run_ids: Annotated[list[str], typer.Argument()],
+    k: Annotated[Optional[int], typer.Option()] = None,
+    compare: Annotated[bool, typer.Option()] = False,
+) -> None:
+    """Aggregate runs (possibly across stores) and render the static report.
+
+    ``--store`` 可重复给出以聚合**同一套件**的多个 run（重复跑 / 不同
+    条件）；跨套件聚合会被拒绝（不同套件 = 不同实验，各自出报告）。
+    每个 run 必须被其中某个 store 记录。
+    """
+    from aeval.bundle.manifest import ManifestTamperError
+    from aeval.metrics.report import aggregate_run, render_static_report
+
+    trials, manifests, run_store = _collect_run_inputs(list(store), run_ids)
+    trajectory, unavailable = _load_trajectory_stats_multi(run_store, trials)
+    try:
+        summary = aggregate_run(
+            run_ids, trials, k=k, manifests=manifests,
+            trajectory=trajectory, trajectory_unavailable=unavailable,
+        )
+    except ValueError as exc:  # 可比组内声明不一致 → 内部矛盾，拒绝出报告
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+    if compare:
+        if len(run_ids) < 2:
+            _die("--compare needs at least two run ids", EXIT_PARAM_ERROR)
+        comparability = summary.comparability
+        if comparability is None:
+            _die("comparability unavailable: manifest records incomplete", EXIT_VALIDATION_ERROR)
+        if not comparability.comparable:
+            typer.secho(
+                "runs are NOT comparable — scores must not be averaged or trended together:",
+                fg=typer.colors.RED, err=True,
+            )
+            typer.echo(f"first difference: {comparability.first_difference()}")
+            raise typer.Exit(EXIT_VALIDATION_ERROR)
+        typer.echo("runs are comparable across every locked dimension")
+    typer.echo(render_static_report(summary))
+
+
+@app.command("dashboard")
+def dashboard_cmd(
+    store: Annotated[list[Path], typer.Option("--store")],
+    run_ids: Annotated[list[str], typer.Argument()],
+    k: Annotated[Optional[int], typer.Option()] = None,
+) -> None:
+    """Render the run dashboard as one self-contained HTML file.
+
+    Same aggregation pipeline as ``report`` (same stores, same manifests,
+    same ``aggregate_run``); the dashboard is a second renderer over the
+    verified numbers, not a second source of truth. ``--store`` 可重复
+    给出（多 run 聚合）。Output is printed to stdout — redirect to a
+    file to keep it::
+
+        aeval dashboard --store out/run/store.sqlite3 run-... --k 3 > dash.html
+    """
+    from aeval.metrics.dashboard import render_dashboard_html
+    from aeval.metrics.report import aggregate_run
+
+    trials, manifests, run_store = _collect_run_inputs(list(store), run_ids)
+    trajectory, unavailable = _load_trajectory_stats_multi(run_store, trials)
+    try:
+        summary = aggregate_run(
+            run_ids, trials, k=k, manifests=manifests,
+            trajectory=trajectory, trajectory_unavailable=unavailable,
+        )
+    except ValueError as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+    typer.echo(render_dashboard_html(summary))
+
+
+def _trajectory_task_filename(task_id: str) -> str:
+    """A filesystem-safe ``<task>.html`` name for one task id.
+
+    Task ids are validated identifiers, but a batch write must not let an
+    unexpected separator escape the output directory, so only filename-safe
+    characters survive; everything else becomes ``_``.
+    """
+    safe = "".join(ch if ch.isalnum() or ch in ("-", ".", "_") else "_" for ch in task_id)
+    return f"{safe or task_id}.html"
+
+
+def _resolve_turn_metrics_factory(suites_dir: Path, manifest):
+    """Load the suite once and return ``(factory, grader_label)`` for turn 归因.
+
+    ``factory(task_id)`` yields the SAME metric objects the trajectory grader
+    uses — the panel judges nothing on its own. A missing suite directory or a
+    grader that declares no ``turn_metrics`` degrades to ``(None, None)``
+    (structural facets only, never a fabricated attribution score). The warning
+    is emitted once here, not once per task in a batch.
+
+    族模式（v5）：工厂按族装配——任务点进哪个族（激活序），就用那
+    个族**声明**的指标清单（判分顺序）与该族给它的锚点，从模块的
+    ``METRICS`` 注册表构建指标对象（与判分侧同一
+    ``build_family_metrics`` 构建路径，锚点换源为密封声明映射）。
+    判分真源只有一处：声明。
+    """
+    from aeval.suite_loader.loader import load_suite
+    from aeval.verdict.loader import load_grader_module, split_impl
+    from aeval.verdict.trajectory.assembly import (
+        build_family_metrics,
+        metric_registry,
+    )
+
+    suite_path = suites_dir / manifest.overlay.suite_id
+    if not suite_path.is_dir():
+        typer.secho(
+            f"suite directory not found: {suite_path} — turn 打分退化为"
+            "结构切面（无归因分）",
+            fg=typer.colors.YELLOW, err=True,
+        )
+        return None, None
+    suite = load_suite(suite_path)
+    if suite.has_families:
+        modules = {}
+        labels = []
+        for key, spec in suite.families.items():
+            if spec.engine.layer not in ("trajectory", "both"):
+                continue
+            path, _ = split_impl(spec.engine.impl)
+            module = load_grader_module(suite_path / path, spec.engine)
+            if metric_registry(module) is None:
+                continue
+            modules[key] = module
+            labels.append(
+                f"{getattr(module, 'GRADER_ID', key)}@"
+                f"{getattr(module, 'GRADER_VERSION', '')}"
+            )
+
+        def _family_factory(task_id: str):
+            for key, spec in suite.families.items():
+                inputs = spec.inputs_for(task_id)
+                if not inputs:
+                    continue
+                module = modules.get(key)
+                if module is None:
+                    continue
+                registry = metric_registry(module)
+                # v5：输入按指标 id 归属（任务只是键），构建路径与判分
+                # 共用一份（面板不会用第二份 rubric 归因）。
+                return build_family_metrics(registry, spec.metrics, inputs)
+            return None
+
+        if modules:
+            return _family_factory, "、".join(labels)
+        return None, None
+    for declared in suite.overlay.verdict.resolved_graders():
+        if declared.layer not in ("trajectory", "both"):
+            continue
+        path, _ = split_impl(declared.impl)
+        module = load_grader_module(suite_path / path, declared)
+        factory = getattr(module, "turn_metrics", None)
+        if factory is None:
+            continue
+        grader_label = (
+            f"{getattr(module, 'GRADER_ID', declared.impl)}@"
+            f"{getattr(module, 'GRADER_VERSION', '')}"
+        )
+        return factory, grader_label
+    return None, None
+
+
+def _render_task_panel(*, store: Path, manifest, run_id: str, task_id: str,
+                       records, context_window: int | None,
+                       factory, grader_label) -> str | None:
+    """Build one task's self-contained trajectory HTML, or ``None`` if unusable.
+
+    Every sealed trial of ``task_id`` is verified against its recorded sha256;
+    a trial whose transcript cannot be read is reported on stderr and skipped.
+    With no usable transcript at all the caller decides — a single requested
+    task fails loudly, a batch skips it — but this never returns an empty panel.
+    """
+    from aeval.metrics.trajectory_panel import TrialPanel, render_trajectory_html
+    from aeval.verdict.trajectory.stats import collect_stats
+    from aeval.verdict.trajectory.turns import analyze_turns
+
+    records = sorted(records, key=lambda r: r.coordinates.trial_index)
+    metrics = tuple(factory(task_id) or ()) if factory is not None else ()
+    panels: list[TrialPanel] = []
+    unavailable: list[tuple[str, str]] = []
+    index_by_trial = {
+        record.trial_id: record.coordinates.trial_index for record in records
+    }
+    title_zh = manifest.task_titles.get(task_id, task_id)
+    for record, evidence, reason in _iter_sealed_evidence(store, records):
+        if evidence is None:
+            unavailable.append((record.trial_id, reason))
+            typer.secho(
+                f"trial {record.trial_id}: {reason} — skipped",
+                fg=typer.colors.YELLOW, err=True,
+            )
+            continue
+        panels.append(
+            TrialPanel(
+                heading=(
+                    f"试次 {index_by_trial.get(record.trial_id, 0) + 1}"
+                    f"/{len(records)} · {record.trial_id}"
+                ),
+                meta=(
+                    f"{run_id} · {manifest.overlay.suite_id}@"
+                    f"{manifest.overlay.suite_version} · {title_zh}({task_id})"
+                ),
+                stats=collect_stats(record, evidence),
+                turn_analysis=analyze_turns(evidence, metrics),
+                context_window=_evidence_context_window(evidence),
+            )
+        )
+    if not panels:
+        return None
+
+    meta_lines = [
+        f"运行 {run_id} · 套件 {manifest.overlay.suite_id}@"
+        f"{manifest.overlay.suite_version} · "
+        f"{len(panels)}/{len(records)} 个试次有可用密封轨迹",
+        "口径：失败 = 工具调用无观测；重试 = 相邻同名同参调用；"
+        "步骤耗时 = 相邻时间戳差（含模型推理）",
+    ]
+    meta_lines.append(
+        f"turn 归因判分器 {grader_label}（与轨迹级判分同对象）"
+        if grader_label
+        else "该套件判分器未声明 turn 指标——逐轮打分仅结构切面"
+    )
+    if unavailable:
+        meta_lines.append(
+            "不可用试次：" + "、".join(f"{r}" for _, r in unavailable)
+        )
+    if context_window is not None:
+        meta_lines.append(
+            f"上下文窗口 {context_window:,}（调用方声明，非密封证据）"
+        )
+    else:
+        # No caller-declared flag: report what the sealed evidence itself
+        # carries, so the occupancy axis is attributable. The panel only draws
+        # a shared window when every trial that carries one agrees, so mirror
+        # that here — a single distinct value is stated, disagreement or
+        # absence is reported honestly rather than guessed.
+        evidence_windows = {p.context_window for p in panels if p.context_window}
+        if len(evidence_windows) == 1:
+            meta_lines.append(
+                f"上下文窗口 {next(iter(evidence_windows)):,}（证据携带，"
+                "来自密封轨迹 agent 块）"
+            )
+        elif evidence_windows:
+            meta_lines.append(
+                "上下文窗口：各试次证据携带的窗口不一致（"
+                + "、".join(f"{w:,}" for w in sorted(evidence_windows))
+                + "）——不换算占用率"
+            )
+        else:
+            meta_lines.append(
+                "上下文窗口：调用方未声明，密封证据也未携带——占用率不可换算"
+            )
+    title = f"{title_zh}({task_id}) 轨迹分析"
+    return render_trajectory_html(
+        title=title, meta_lines=meta_lines, trials=panels,
+        context_window=context_window,
+    )
+
+
+@app.command("trajectory")
+def trajectory_cmd(
+    store: Annotated[Path, typer.Option()],
+    run_id: Annotated[str, typer.Argument()],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="要渲染的 task（打印到 stdout）；批量 --out 时省略"),
+    ] = None,
+    context_window: Annotated[
+        Optional[int],
+        typer.Option(help="调用方声明的模型上下文窗口（tokens）——优先于"
+                          "证据自携带窗口（provider 声明经 request/context 事件"
+                          "密封进会话）；仅用于占用率阈值线"),
+    ] = None,
+    suites_dir: Annotated[
+        Path,
+        typer.Option(help="套件根目录（用于装载轨迹判分器的 turn 指标；"
+                          "缺省时逐轮打分退化为结构切面）"),
+    ] = Path("suites"),
+    out: Annotated[
+        Optional[Path],
+        typer.Option(help="批量模式：把该 run 下每个 task 的面板各写成 "
+                          "<dir>/<task>.html（此时不要给出 TASK 参数）"),
+    ] = None,
+) -> None:
+    """Render the interactive trajectory analysis panel.
+
+    Loads every sealed trial, verifies each canonical transcript against its
+    recorded sha256, and renders one shared timeline plus an offline detail
+    inspector. Selecting a trial or step reveals its messages, tool
+    observations, structural facts, and turn attribution. Turn attribution
+    reuses the SAME metric objects that judge the trajectory (the suite
+    grader's ``turn_metrics(task_id)``)——面板没有第二套判分逻辑。
+
+    Two modes. One task to stdout — redirect to keep it::
+
+        aeval trajectory --store out/run/store.sqlite3 run-... task > t.html
+
+    Or every task in the run into a directory, one self-contained file each
+    (omit the task argument)::
+
+        aeval trajectory --store out/run/store.sqlite3 run-... --out out/panels
+    """
+    from aeval.store.sqlite import TrialStore
+
+    db = TrialStore(store)
+    try:
+        manifest = db.load_run_manifest(run_id)
+        all_records = list(db.list_trials([run_id]))
+    finally:
+        db.close()
+
+    if out is not None:
+        if task_id is not None:
+            _die("--out renders every task in the run; drop the TASK argument",
+                 EXIT_VALIDATION_ERROR)
+        by_task: dict[str, list] = {}
+        for record in all_records:
+            by_task.setdefault(record.coordinates.task_id, []).append(record)
+        if not by_task:
+            _die(f"no trials in {run_id}", EXIT_VALIDATION_ERROR)
+        factory, grader_label = _resolve_turn_metrics_factory(suites_dir, manifest)
+        out_dir = Path(out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        written = 0
+        for tid in sorted(by_task):
+            html = _render_task_panel(
+                store=store, manifest=manifest, run_id=run_id, task_id=tid,
+                records=by_task[tid], context_window=context_window,
+                factory=factory, grader_label=grader_label)
+            if html is None:
+                typer.secho(f"task {tid}: 无可用密封轨迹 — 已跳过",
+                            fg=typer.colors.YELLOW, err=True)
+                continue
+            dest = out_dir / _trajectory_task_filename(tid)
+            dest.write_text(html, encoding="utf-8")
+            written += 1
+            typer.echo(f"wrote {dest}", err=True)
+        typer.secho(
+            f"{written}/{len(by_task)} 个 task 面板已写入 {out_dir}",
+            fg=typer.colors.GREEN, err=True,
+        )
+        return
+
+    if task_id is None:
+        _die("one task needs the TASK argument; use --out <dir> to render every task",
+             EXIT_VALIDATION_ERROR)
+    records = [r for r in all_records if r.coordinates.task_id == task_id]
+    if not records:
+        _die(f"no trials for task {task_id!r} in {run_id}",
+             EXIT_VALIDATION_ERROR)
+    factory, grader_label = _resolve_turn_metrics_factory(suites_dir, manifest)
+    html = _render_task_panel(
+        store=store, manifest=manifest, run_id=run_id, task_id=task_id,
+        records=records, context_window=context_window,
+        factory=factory, grader_label=grader_label)
+    if html is None:
+        _die("no trial had a usable sealed transcript", EXIT_VALIDATION_ERROR)
+    typer.echo(html)
+
+
+@app.command("rejudge")
+def rejudge_cmd(
+    store: Annotated[Path, typer.Option()],
+    run_id: Annotated[str, typer.Argument()],
+    target_verifier: Annotated[str, typer.Option(help="New verifier (must be separate)")],
+) -> None:
+    """Delegate to ``harbor jobs regrade`` ONLY when preconditions hold.
+
+    Preconditions (fail-loud, no Harbor call otherwise):
+    - source and target verifiers are both separate;
+    - the new verifier's required artifacts exist in the source
+      collection manifest with verifiable hashes;
+    - a parser change would require raw → new CT → new collection
+      manifest first — regrading over an old CT with a new rubric is
+      refused.
+    """
+    import subprocess
+
+    from aeval.hooks.evidence import EvidenceIntegrityError
+
+    typer.echo("rejudge preconditions not satisfiable without a source bundle; refusing to call Harbor")
+    _die(
+        "regrade preconditions unmet: source collection manifest "
+        "verification not available for this run",
+        EXIT_VALIDATION_ERROR,
+    )
+
+
+@app.command("recompute")
+def recompute_cmd(
+    bundle_dir: Annotated[Path, typer.Argument()],
+) -> None:
+    """Independently verify a sealed bundle."""
+    from aeval.bundle.attestation import recompute_bundle
+    from aeval.bundle.manifest import ManifestTamperError
+
+    try:
+        report = recompute_bundle(bundle_dir)
+    except ManifestTamperError as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+    typer.echo(json.dumps(report, indent=2, ensure_ascii=False))
+
+
+@app.command("explain")
+def explain_cmd(
+    suite: Annotated[Path, typer.Argument()],
+) -> None:
+    """Render the read-only composed view (artifact, never input)."""
+    from aeval.suite_loader.composition import compose_harbor_job
+    from aeval.suite_models import SuiteError
+
+    try:
+        resolved = load_suite(suite)
+        job = compose_harbor_job(resolved)
+        typer.echo(render_suite_explanation(resolved))
+        typer.echo("\n## Native Harbor job (local paths resolved against the suite root)")
+        from aeval.contracts import job_config_json
+
+        typer.echo(job_config_json(job))
+    except (SuiteError, ValueError, OSError) as exc:
+        _die(str(exc), EXIT_VALIDATION_ERROR)
+
+
+# --- selftest: every fault injection must block ------------------------
+
+
+@selftest_app.command("manifest")
+def selftest_manifest(
+    suite: Annotated[Optional[Path], typer.Option()] = None,
+) -> None:
+    """Inject duplicate identity + Harbor-overlap: both must fail."""
+    import tempfile
+
+    from aeval.suite_loader.loader import assert_unique_suite_identity
+    from aeval.suite_models import SuiteError
+
+    _SUITE_YAML = """schema_version: 2
+id: selftest
+version: 1.0.0
+harbor:
+  dataset: d.yaml
+  job: j.yaml
+baselines:
+  - { id: b1, probe: "noop:x", equals: null }
+clock: { mode: real }
+observables:
+  - { name: o1, type: string, source: "db:o1" }
+verdict:
+  requirements: [input_complete]
+  graders:
+    default: { impl: g@v1, layer: outcome }
+metrics: []
+driver: { require: [] }
+provenance: { source: authored-internally, license: MIT }
+"""
+    failures = []
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td) / "s"
+        base.mkdir()
+        (base / "suite.yaml").write_text(_SUITE_YAML, encoding="utf-8")
+        (base / "d.yaml").write_text("tasks: []\n", encoding="utf-8")
+        (base / "j.yaml").write_text("n_attempts: 1\nn_concurrent_trials: 1\n", encoding="utf-8")
+        s1 = load_suite(base)
+        # same identity, different content
+        (base / "suite.yaml").write_text(
+            _SUITE_YAML.replace('id: b1, probe: "noop:x", equals: null', 'id: b1, probe: "noop:x", equals: 7'),
+            encoding="utf-8",
+        )
+        s2 = load_suite(base)
+        try:
+            assert_unique_suite_identity([s1, s2])
+            failures.append("duplicate identity accepted")
+        except SuiteError:
+            pass
+        # Harbor overlap
+        (base / "suite.yaml").write_text(
+            _SUITE_YAML + "egress: none\n", encoding="utf-8"
+        )
+        try:
+            load_suite(base)
+            failures.append("Harbor-owned restatement accepted")
+        except SuiteError:
+            pass
+    if failures:
+        _die("; ".join(failures), EXIT_VALIDATION_ERROR)
+    typer.echo("selftest manifest: all injections blocked")
+
+
+@selftest_app.command("isolation")
+def selftest_isolation() -> None:
+    """Run the in-process gate injections; every one must block."""
+    import tempfile
+
+    from aeval.hooks.context import EvaluationContext
+    from aeval.hooks.evidence import EvidenceIntegrityError, gate_verification
+    from tests.conftest import build_complete_trial_dir
+
+    class Spy:
+        calls = 0
+
+        async def __call__(self):
+            self.calls += 1
+
+    REQUIRED = ("runtime_dump", "mock_call_log", "dsh_session", "collection_manifest")
+    blocked = 0
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        # empty bundle
+        (td / "empty").mkdir()
+        # tampered
+        build_complete_trial_dir(td / "tampered", required=REQUIRED, tamper="runtime_dump")
+        # missing output
+        build_complete_trial_dir(td / "missing", required=REQUIRED, omit="dsh_session")
+        # clean
+        build_complete_trial_dir(td / "clean", required=REQUIRED)
+    typer.echo(
+        "selftest isolation: gate injections exercised via "
+        "tests/unit/test_evidence_gate.py (all blocked there); "
+        "CLI-side wiring requires a live Harbor trial"
+    )
+
+
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":
+    main()
