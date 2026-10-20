@@ -1,0 +1,89 @@
+# The shipped DSH adapter. Values agree with aeval/agents/dsh/agent.py — the
+# declaration is validated against the class (a disagreement is an error).
+extends: _base/agent.base.yaml
+
+id: dsh
+version: "1"
+import_path: "aeval.agents.dsh.agent:DshAgent"
+
+provides:
+  - acp_stdio
+  - sdk_jsonrpc
+  - shell
+  - file_tools
+  - resume
+
+mode: acp_stdio
+budget_enforcement: gateway_lease
+transcript:
+  source: native_session_via_bridge
+  reader: dsh-official-session-reader
+  capabilities:
+    - atif_via_bridge
+    - claim_check
+    - token_usage
+  fields_available:
+    events: ok
+    token_usage: ok
+
+# Observed in the live sandbox and bound to the lock: the Node runtime the DSH
+# release is pinned against.
+observations:
+  - node
+
+# The in-sandbox control stack this adapter needs (job token, session minting,
+# the cordis patch). Declared, so the framework never deploys it into another agent.
+control_stack: dsh
+
+# Model traffic routing: DSH's control-stack
+# transport speaks the broker wire (aeval-model-broker/3) natively, so there
+# is no facade to deploy and no facade env to inject — the composition skips
+# both on this declaration.
+model_routing:
+  agent_protocol: gateway_native
+
+sandbox_home: /logs/agent/dsh-home
+session_artifact_dir: dsh-home
+
+# Evidence artifacts this adapter produces. The session-record slot's fixed
+# path is declared here (and mirrored on the class as
+# SESSION_RECORD_OUTPUT_PATH, cross-checked at load): the value is
+# byte-identical to the path the framework hardcoded before the slot
+# generalised, so historical bundles and plans recompute identically.
+artifacts:
+  - name: dsh-session-record
+    slot: dsh_session
+    path: sessions/session.v4.jsonl.zstd
+
+# How this adapter is launched in a deployment. These paths are cluster facts
+# (install prefix, npm cache, where the official session reader is mounted), so
+# they bind to an environment rather than to the adapter's identity — which is
+# exactly why they live here instead of in every job file that runs DSH.
+# 运行时需求（方案二）：沙箱里必须存在这个 CLI 才能跑起来。key 在组合期
+# 与 agents/_runtime/images.yaml 对账——没有对应行、或行的镜像摘要与
+# --sandbox-image 不一致，都在建沙箱之前拒绝，而不是在 trial 里炸
+# "command not found"。needs 是人类可读的供给事实，用于报错与审计。
+runtime:
+  key: dsh
+  needs:
+    - node (Harbor installed-agent 提供)
+    - npm 缓存或内网 registry 可达
+launch:
+  # Verified on a real target host (openEuler 24.03 SP1 aarch64); matches the paths the
+  # hand-written jobs/e2e-hello/jobs/dsh.yaml used.
+  default:
+    override_setup_timeout_sec: 900
+    kwargs:
+      install_prefix: "/dev/shm/dshpkg"
+      npm_cache: "/dev/shm/npmcache"
+      session_reader: "/opt/aeval/session_reader.js"
+      run_timeout_sec: 600
+  # The TerminaBench cluster arm. npm_cache is pre-baked in the base image, and
+  # the session reader ships inside the control bundle mounted at /root/src.
+  lab:
+    override_setup_timeout_sec: 900
+    kwargs:
+      install_prefix: "/dev/shm/dshpkg"
+      npm_cache: "/root/.npm"
+      session_reader: "/root/src/dsh-eval-control/dist/session_reader.js"
+      run_timeout_sec: 900
