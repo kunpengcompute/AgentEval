@@ -1,0 +1,34 @@
+schema_version: 2
+id: deepagent-budget
+# 0.2.0（2026-10-08）：注释清理——去掉对外不可读的内部阶段/缺陷编号与机器名。判分口径与任务集不变；因文件字节变化，本版本不与上一版同域可比。
+version: 0.2.0
+# 与 deepagent-hello 同一任务形态（写 hello 到 /workspace/result），但**带
+# 预算**：这是计量与拦截的验收套件。适配器声明
+# budget_enforcement=gateway_lease 后，这些上限才真的会被执行（façade →
+# broker lease 逐调用计量/拦截）；在此之前同样的声明会被准入门正确拒绝。
+# 两个套件分开存在：hello 是冒烟（不设上限），本套件是计量与拦截。
+extends: _base/harbor.base.yaml
+harbor:
+  job: jobs/deepagent-budget.yaml
+driver:
+  # 驱动能力要求是本套件自己的事实（基座不含任何 agent 特性）：面向 ACP
+  # 适配器，只要求 deepagent 真正提供并能被验证的三项。
+  require: [acp_stdio, shell, file_tools]
+  session_record: agent_session_record
+observables:
+  - { name: result, type: string, source: "file:/workspace/result" }
+verdict:
+  graders:
+    default: { impl: "graders/hello_outcome.py@v1", layer: outcome }
+metrics:
+  - { id: reliability, kind: pass_pow_k, k: 5 }
+# 试次花费上限。operator 的 broker spec 必须携带**不超过**这里的 lease 上限
+# （compose_control_config 把 spec 的 limits 原样写进沙箱控制配置，broker
+# 的 lease 才是真正执行点）—— 套件声明是"这次运行最多能花多少"，
+# 两者不一致时以 lease 为准，且上限只会更紧不会更松。
+budget:
+  max_tokens: 200000
+  max_steps: 40
+  max_seconds: 1800
+  enforcement_point: gateway_lease
+provenance: { source: authored-internally, license: MIT }

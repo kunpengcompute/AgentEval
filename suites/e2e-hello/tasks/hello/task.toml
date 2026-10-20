@@ -1,0 +1,20 @@
+schema_version = "1.4"
+
+[environment]
+# The image is pinned BY DIGEST in environment/Dockerfile's FROM line —
+# deliberately NOT via `docker_image` here. Harbor's e2b backend builds
+# the template from the image alone whenever that key is set, silently
+# ignoring the Dockerfile, which drops the baseline seed `RUN` (found on
+# the aarch64 host: /workspace/ready was missing and every trial failed
+# the baseline gate). One source of image identity.
+network_mode = "no-network"
+
+[[verifier.collect]]
+# The fixed evidence outputs must be produced by a declared
+# collect command; observables are probed via the environment API and
+# are not collect outputs.
+command = "aeval-collect runtime_dump mock_call_log dsh_session canonical_transcript"
+
+[metadata.provenance]
+source = "authored-internally"
+license = "MIT"

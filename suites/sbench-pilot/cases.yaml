@@ -1,0 +1,29 @@
+# 本套件从共享用例库（aeval/cases/）按类别注入的服务自查用例。
+#
+# 用例库不属于本套件：terminal-bench、服务基准、会话基准等都只是
+# 消费方，各自在 cases.yaml 里声明要的类别。注入/漂移检测：
+#
+#   .venv/bin/python cases/generate.py --suite suites/sbench-pilot
+#   .venv/bin/python cases/generate.py --suite suites/sbench-pilot --check
+#
+# 任务树 tasks/<category>.<case>/ 是注入产物：改用例改库里的
+# checkers/<category>.py 后重新注入；反选类别后残留的任务会被清掉。
+# 本套件是全类别消费者（12 类 = 89 例；第三方集成与流程编排两类
+# 已按 0.2.0 需求移出评测范围，0.3.0 又收窄 ddl 类——messages/
+# plans/plan_steps/tasks/memory_records 五张表与消息顺序、双写检测
+# 不再单独成例；0.4.0 移出 error 类 HMAC 三用例；0.5.0 移出
+# report.hmac_auth、task_center.hmac_execute 与 tool_audit 两个
+# SSRF 用例，见 suite.yaml 变更记录）。
+categories:
+  - health
+  - chat
+  - session
+  - tools
+  - a2a
+  - ddl
+  - error
+  - task_center
+  - artifact
+  - engine_lifecycle
+  - tool_audit
+  - report
